@@ -1,0 +1,3 @@
+## 2026-10-01 - Single-pass line processing and regex hoisting in log parsing
+**Learning:** In client-side log analyzers processing raw log strings, calling `Object.entries()` per log line creates hundreds of thousands of ephemeral array allocations. Furthermore, instantiating regexes and filtering arrays with `.filter()` before iteration doubles memory overhead and garbage collection pressure.
+**Action:** Hoist regexes and pre-flatten pattern entries outside the main parsing loop; use single-pass string splitting with index-based `for` loops, cache nested object property lookups, and lazy-allocate arrays for flagged events.
