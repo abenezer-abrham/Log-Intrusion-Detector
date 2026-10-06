@@ -1,0 +1,3 @@
+## 2026-10-06 - Tight-loop log parsing allocation bottleneck in detector.js
+**Learning:** In client-side server log detection (`analyzeLogs`), allocating intermediate arrays (`split('\n').filter()`, `Object.entries(PATTERNS)`), instantiating regexes, and using array `forEach` callbacks inside the main line-parsing loop created severe garbage collection and execution overhead on large log inputs (100k+ lines).
+**Action:** Hoist static regexes (`IP_REGEX`, `STATUS_REGEX`), pre-flatten `PATTERNS` into static arrays, use single-pass index-based `for` loops, lazy-allocate `flaggedReasons`, cache `ipStats[ip]` lookups, and track summary counts inline during loop execution.
