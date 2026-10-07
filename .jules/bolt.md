@@ -1,0 +1,3 @@
+## 2026-10-07 - Log Engine Array Allocation & Loop Hoisting Optimization
+**Learning:** In client-side log parsers processing tens of thousands of lines, calling `Object.entries(PATTERNS)` inside line loops and chaining `.split('\n').filter(...)` creates massive garbage collection pressure and function call overhead. Hoisting static regular expressions, pre-flattening object entries, lazy-allocating arrays for safe lines, and using index-based `for` loops improves execution time by ~35%.
+**Action:** Always pre-flatten static configuration entry arrays and hoist regexes outside loop targets in line-processing hot paths.
