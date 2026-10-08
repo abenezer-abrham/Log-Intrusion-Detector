@@ -1,0 +1,3 @@
+## 2026-10-08 - Hoisting Pattern Entries & Single-Pass Log Scanning
+**Learning:** In LogWatch's `analyzeLogs` engine, calling `Object.entries(PATTERNS)` inside line loops allocated over 100,000 array objects per log scan. Re-creating regexes (`ipRegex`, `statusRegex`) inside `analyzeLogs` and using intermediate `.split('\n').filter(...)` array allocations added significant memory and GC pressure.
+**Action:** Pre-flatten `PATTERNS` into static `PATTERN_ENTRIES` with precomputed severity ranks outside `analyzeLogs`, hoist top-level regular expressions, use single-pass index `for` loops, lazy-allocate line-level result arrays, and track summary counts inline.
