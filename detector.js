@@ -76,6 +76,21 @@ const SAMPLES = {
 10.0.0.8 - - [17/Mar/2026:09:05:12 +0000] "GET /favicon.ico HTTP/1.1" 200 115 "-" "Chrome/120.0.0.0"`
 };
 
+// --- OPTIMIZED REGEX & PATTERNS (HOISTED FOR PERFORMANCE) ---
+// Hoisting static regular expressions and pre-flattening PATTERNS avoids repeated object iteration,
+// allocation, and compilation during log processing runs.
+const IP_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
+const STATUS_REGEX = /\s([2345]\d{2})\s/;
+const PATTERN_ENTRIES = Object.entries(PATTERNS).map(([key, rule]) => ({
+  key,
+  regex: rule.regex,
+  name: rule.name,
+  type: rule.type,
+  score: rule.score,
+  desc: rule.desc,
+  severityVal: rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1
+}));
+
 // --- CORE ANALYSIS ENGINE ---
 
 function analyzeLogs(rawText) {
@@ -83,61 +98,76 @@ function analyzeLogs(rawText) {
     return { valid: false, error: 'Log input is empty. Please paste logs first.' };
   }
 
-  const lines = rawText.split('\n').filter(l => l.trim().length > 0);
+  // Single-pass line splitting without creating intermediate filtered arrays
+  const lines = rawText.split('\n');
+  const numLines = lines.length;
   const events = [];
   const findingsMap = new Map();
-  const ipStats = {};
+  const ipStats = Object.create(null);
 
   let riskTotal = 0;
+  let validLineCount = 0;
 
-  // regex to roughly extract IP and HTTP Status from common access logs
-  const ipRegex = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-  const statusRegex = /\s([2345]\d{2})\s/;
+  // Optimized sequential loop over log lines
+  for (let index = 0; index < numLines; index++) {
+    const line = lines[index];
+    if (line.trim().length === 0) continue;
+    validLineCount++;
 
-  lines.forEach((line, index) => {
     let lineType = 'safe'; // default
     let highestLineScore = 0;
-    const flaggedReasons = [];
+    let flaggedReasons = null; // Lazy-allocated to avoid array creation for clean lines
     
-    // basic extraction
-    const ipMatch = line.match(ipRegex);
+    // Extraction using hoisted regexes
+    const ipMatch = line.match(IP_REGEX);
     const ip = ipMatch ? ipMatch[0] : 'unknown';
-    const statusMatch = line.match(statusRegex);
-    const status = statusMatch ? parseInt(statusMatch[1], 10) : null;
+    const statusMatch = line.match(STATUS_REGEX);
+    const status = statusMatch ? +statusMatch[1] : null;
 
-    if (!ipStats[ip]) {
-      ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
+    // Cached lookup for IP stats
+    let stats = ipStats[ip];
+    if (!stats) {
+      stats = ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
     }
-    ipStats[ip].count++;
-    if (status === 401) ipStats[ip][401]++;
-    if (status === 403) ipStats[ip][403]++;
-    if (status === 404) ipStats[ip][404]++;
-    if (status >= 500) ipStats[ip][500]++;
+    stats.count++;
+    if (status === 401) stats[401]++;
+    else if (status === 403) stats[403]++;
+    else if (status === 404) stats[404]++;
+    else if (status >= 500) stats[500]++;
 
-    // Regex Check 1: Iterating over defined patterns (SQLi, XSS, Path traversal, etc)
-    Object.entries(PATTERNS).forEach(([key, rule]) => {
-      if (rule.regex.test(line)) {
-        flaggedReasons.push(rule.name);
+    // Regex Check 1: Iterating over hoisted pattern entries
+    for (let p = 0; p < PATTERN_ENTRIES.length; p++) {
+      const entry = PATTERN_ENTRIES[p];
+      if (entry.regex.test(line)) {
+        if (!flaggedReasons) flaggedReasons = [];
+        flaggedReasons.push(entry.name);
         
         // Ensure finding appears only once in summary
-        if (!findingsMap.has(key)) {
-          findingsMap.set(key, { ...rule, occurrence: 1 });
-          riskTotal += rule.score; // only add score once per pattern type for overall log
+        const existingFinding = findingsMap.get(entry.key);
+        if (!existingFinding) {
+          findingsMap.set(entry.key, {
+            name: entry.name,
+            type: entry.type,
+            score: entry.score,
+            desc: entry.desc,
+            regex: entry.regex,
+            occurrence: 1
+          });
+          riskTotal += entry.score; // only add score once per pattern type for overall log
         } else {
-          findingsMap.get(key).occurrence++;
+          existingFinding.occurrence++;
         }
 
         // track severity
-        const lineVal = rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1;
-        if (lineVal > highestLineScore) {
-          highestLineScore = lineVal;
-          lineType = rule.type;
+        if (entry.severityVal > highestLineScore) {
+          highestLineScore = entry.severityVal;
+          lineType = entry.type;
         }
       }
-    });
+    }
 
     // Save event if flagged
-    if (flaggedReasons.length > 0) {
+    if (flaggedReasons) {
       events.push({
         lineNum: index + 1,
         ip,
@@ -146,10 +176,11 @@ function analyzeLogs(rawText) {
         reasons: flaggedReasons.join(', ')
       });
     }
-  });
+  }
 
-  // Heuristics 2: IP Aggregation checks
-  Object.entries(ipStats).forEach(([ip, stats]) => {
+  // Heuristics 2: IP Aggregation checks using standard for...in loop
+  for (const ip in ipStats) {
+    const stats = ipStats[ip];
     // Brute Force: 4+ Auth failures (401/403)
     const fails = stats[401] + stats[403];
     if (fails >= 4) {
@@ -190,7 +221,7 @@ function analyzeLogs(rawText) {
         reasons: 'Scanner Behavior'
       });
     }
-  });
+  }
 
   // Determine overall severity
   const score = Math.min(100, Math.round(riskTotal));
@@ -212,7 +243,7 @@ function analyzeLogs(rawText) {
     events,
     findings,
     summary: {
-      totalLines: lines.length,
+      totalLines: validLineCount,
       flaggedLines: events.filter(e => e.lineNum !== 'Agg').length,
       uniqueIps
     }
@@ -322,13 +353,17 @@ function renderEventTable(events) {
   `).join('');
 }
 
+const HTML_ESCAPE_REGEX = /[&<>"']/g;
+const HTML_ESCAPE_MAP = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;'
+};
+
 function escapeHtml(unsafe) {
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+  return unsafe.replace(HTML_ESCAPE_REGEX, ch => HTML_ESCAPE_MAP[ch]);
 }
 
 function animateScore(targetScore, ringEl, numEl) {
