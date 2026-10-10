@@ -78,83 +78,117 @@ const SAMPLES = {
 
 // --- CORE ANALYSIS ENGINE ---
 
+// Hoisted static RegExps and pre-allocated pattern entries for performance
+const IP_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
+const STATUS_REGEX = /\s([2345]\d{2})\s/;
+const HTML_ESCAPE_REGEX = /[&<>"']/g;
+const HTML_ESCAPE_MAP = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;'
+};
+
+const PATTERN_ENTRIES = Object.entries(PATTERNS).map(([key, rule]) => ({
+  key,
+  rule,
+  rank: rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1
+}));
+
 function analyzeLogs(rawText) {
   if (!rawText.trim()) {
     return { valid: false, error: 'Log input is empty. Please paste logs first.' };
   }
 
-  const lines = rawText.split('\n').filter(l => l.trim().length > 0);
+  // Single-pass line splitting without intermediate filter allocations
+  const lines = rawText.split('\n');
+  const numLines = lines.length;
   const events = [];
   const findingsMap = new Map();
   const ipStats = {};
 
   let riskTotal = 0;
+  let totalLinesParsed = 0;
+  let flaggedLineCount = 0;
 
-  // regex to roughly extract IP and HTTP Status from common access logs
-  const ipRegex = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-  const statusRegex = /\s([2345]\d{2})\s/;
+  const patternCount = PATTERN_ENTRIES.length;
 
-  lines.forEach((line, index) => {
-    let lineType = 'safe'; // default
+  // Optimized single-pass index loop
+  for (let i = 0; i < numLines; i++) {
+    const line = lines[i];
+    if (line.trim().length === 0) continue;
+    totalLinesParsed++;
+
+    let lineType = 'safe';
     let highestLineScore = 0;
-    const flaggedReasons = [];
-    
-    // basic extraction
-    const ipMatch = line.match(ipRegex);
+    let flaggedReasons = null;
+
+    // Fast regex extraction and unary '+' integer conversion
+    const ipMatch = line.match(IP_REGEX);
     const ip = ipMatch ? ipMatch[0] : 'unknown';
-    const statusMatch = line.match(statusRegex);
-    const status = statusMatch ? parseInt(statusMatch[1], 10) : null;
+    const statusMatch = line.match(STATUS_REGEX);
+    const status = statusMatch ? +statusMatch[1] : null;
 
-    if (!ipStats[ip]) {
-      ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
+    // Cache ipStats[ip] lookup
+    let stats = ipStats[ip];
+    if (!stats) {
+      stats = ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
     }
-    ipStats[ip].count++;
-    if (status === 401) ipStats[ip][401]++;
-    if (status === 403) ipStats[ip][403]++;
-    if (status === 404) ipStats[ip][404]++;
-    if (status >= 500) ipStats[ip][500]++;
+    stats.count++;
+    if (status === 401) stats[401]++;
+    else if (status === 403) stats[403]++;
+    else if (status === 404) stats[404]++;
+    else if (status >= 500) stats[500]++;
 
-    // Regex Check 1: Iterating over defined patterns (SQLi, XSS, Path traversal, etc)
-    Object.entries(PATTERNS).forEach(([key, rule]) => {
+    // Iterate over pre-flattened pattern entries with sequential index loop
+    for (let p = 0; p < patternCount; p++) {
+      const entry = PATTERN_ENTRIES[p];
+      const rule = entry.rule;
+
       if (rule.regex.test(line)) {
+        if (!flaggedReasons) flaggedReasons = [];
         flaggedReasons.push(rule.name);
-        
-        // Ensure finding appears only once in summary
-        if (!findingsMap.has(key)) {
+
+        const key = entry.key;
+        const finding = findingsMap.get(key);
+        if (!finding) {
           findingsMap.set(key, { ...rule, occurrence: 1 });
-          riskTotal += rule.score; // only add score once per pattern type for overall log
+          riskTotal += rule.score;
         } else {
-          findingsMap.get(key).occurrence++;
+          finding.occurrence++;
         }
 
-        // track severity
-        const lineVal = rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1;
-        if (lineVal > highestLineScore) {
-          highestLineScore = lineVal;
+        if (entry.rank > highestLineScore) {
+          highestLineScore = entry.rank;
           lineType = rule.type;
         }
       }
-    });
+    }
 
     // Save event if flagged
-    if (flaggedReasons.length > 0) {
+    if (flaggedReasons) {
+      flaggedLineCount++;
       events.push({
-        lineNum: index + 1,
+        lineNum: i + 1,
         ip,
         content: line,
         severity: lineType,
         reasons: flaggedReasons.join(', ')
       });
     }
-  });
+  }
 
-  // Heuristics 2: IP Aggregation checks
-  Object.entries(ipStats).forEach(([ip, stats]) => {
+  // Heuristics 2: IP Aggregation checks using for...in loop
+  for (const ip in ipStats) {
+    const stats = ipStats[ip];
+
     // Brute Force: 4+ Auth failures (401/403)
     const fails = stats[401] + stats[403];
     if (fails >= 4) {
-      if (!findingsMap.has('brute_' + ip)) {
-        findingsMap.set('brute_' + ip, {
+      const bruteKey = 'brute_' + ip;
+      if (!findingsMap.has(bruteKey)) {
+        findingsMap.set(bruteKey, {
           name: 'Authentication Brute Force',
           type: 'critical',
           score: 50,
@@ -173,8 +207,9 @@ function analyzeLogs(rawText) {
 
     // Port Scan / Dir Busting: 6+ 404s
     if (stats[404] >= 6) {
-      if (!findingsMap.has('scan_' + ip)) {
-        findingsMap.set('scan_' + ip, {
+      const scanKey = 'scan_' + ip;
+      if (!findingsMap.has(scanKey)) {
+        findingsMap.set(scanKey, {
           name: 'Directory Busting / Scanning',
           type: 'high',
           score: 30,
@@ -190,7 +225,7 @@ function analyzeLogs(rawText) {
         reasons: 'Scanner Behavior'
       });
     }
-  });
+  }
 
   // Determine overall severity
   const score = Math.min(100, Math.round(riskTotal));
@@ -212,8 +247,8 @@ function analyzeLogs(rawText) {
     events,
     findings,
     summary: {
-      totalLines: lines.length,
-      flaggedLines: events.filter(e => e.lineNum !== 'Agg').length,
+      totalLines: totalLinesParsed,
+      flaggedLines: flaggedLineCount,
       uniqueIps
     }
   };
@@ -323,12 +358,7 @@ function renderEventTable(events) {
 }
 
 function escapeHtml(unsafe) {
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+  return unsafe.replace(HTML_ESCAPE_REGEX, char => HTML_ESCAPE_MAP[char]);
 }
 
 function animateScore(targetScore, ringEl, numEl) {
