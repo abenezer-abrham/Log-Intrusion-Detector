@@ -46,6 +46,28 @@ const PATTERNS = {
   }
 };
 
+/* --- PERFORMANCE OPTIMIZATION CONSTANTS --- */
+// Hoist static regular expressions to avoid re-creation overhead per function call
+const IP_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
+const STATUS_REGEX = /\s([2345]\d{2})\s/;
+
+// Pre-flatten PATTERNS object into an array with precomputed severity ranks for fast loop iteration
+const PATTERN_ENTRIES = Object.entries(PATTERNS).map(([key, rule]) => ({
+  key,
+  rule,
+  rank: rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1
+}));
+
+// Fast single-pass HTML escaping regex and lookup map
+const HTML_ESCAPE_REGEX = /[&<>"']/g;
+const HTML_ESCAPES = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;'
+};
+
 /* --- SAMPLE LOGS --- */
 const SAMPLES = {
   brute: `192.168.1.100 - - [17/Mar/2026:10:00:01 +0000] "POST /login HTTP/1.1" 401 120 "-" "Mozilla/5.0"
@@ -83,61 +105,73 @@ function analyzeLogs(rawText) {
     return { valid: false, error: 'Log input is empty. Please paste logs first.' };
   }
 
-  const lines = rawText.split('\n').filter(l => l.trim().length > 0);
+  // Single-pass line splitting (avoiding intermediate .filter() array allocation)
+  const lines = rawText.split('\n');
+  const numLines = lines.length;
   const events = [];
   const findingsMap = new Map();
   const ipStats = {};
 
   let riskTotal = 0;
+  let parsedLineCount = 0;
+  let flaggedLineCount = 0;
 
-  // regex to roughly extract IP and HTTP Status from common access logs
-  const ipRegex = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-  const statusRegex = /\s([2345]\d{2})\s/;
+  for (let index = 0; index < numLines; index++) {
+    const line = lines[index];
+    if (line.trim().length === 0) continue;
 
-  lines.forEach((line, index) => {
+    parsedLineCount++;
     let lineType = 'safe'; // default
     let highestLineScore = 0;
-    const flaggedReasons = [];
-    
-    // basic extraction
-    const ipMatch = line.match(ipRegex);
+    let flaggedReasons = null; // Lazy-allocated array for detected threat names
+
+    // Basic extraction using pre-compiled regex and unary '+' number conversion
+    const ipMatch = line.match(IP_REGEX);
     const ip = ipMatch ? ipMatch[0] : 'unknown';
-    const statusMatch = line.match(statusRegex);
-    const status = statusMatch ? parseInt(statusMatch[1], 10) : null;
+    const statusMatch = line.match(STATUS_REGEX);
+    const status = statusMatch ? +statusMatch[1] : null;
 
-    if (!ipStats[ip]) {
-      ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
+    // Fast cached lookup for IP statistics
+    let stats = ipStats[ip];
+    if (!stats) {
+      stats = ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
     }
-    ipStats[ip].count++;
-    if (status === 401) ipStats[ip][401]++;
-    if (status === 403) ipStats[ip][403]++;
-    if (status === 404) ipStats[ip][404]++;
-    if (status >= 500) ipStats[ip][500]++;
+    stats.count++;
+    if (status === 401) stats[401]++;
+    else if (status === 403) stats[403]++;
+    else if (status === 404) stats[404]++;
+    else if (status !== null && status >= 500) stats[500]++;
 
-    // Regex Check 1: Iterating over defined patterns (SQLi, XSS, Path traversal, etc)
-    Object.entries(PATTERNS).forEach(([key, rule]) => {
+    // Regex Check 1: Iterating over pre-flattened pattern entries
+    for (let p = 0; p < PATTERN_ENTRIES.length; p++) {
+      const entry = PATTERN_ENTRIES[p];
+      const rule = entry.rule;
+
       if (rule.regex.test(line)) {
+        if (!flaggedReasons) flaggedReasons = [];
         flaggedReasons.push(rule.name);
-        
+
         // Ensure finding appears only once in summary
-        if (!findingsMap.has(key)) {
+        const key = entry.key;
+        let finding = findingsMap.get(key);
+        if (!finding) {
           findingsMap.set(key, { ...rule, occurrence: 1 });
           riskTotal += rule.score; // only add score once per pattern type for overall log
         } else {
-          findingsMap.get(key).occurrence++;
+          finding.occurrence++;
         }
 
-        // track severity
-        const lineVal = rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1;
-        if (lineVal > highestLineScore) {
-          highestLineScore = lineVal;
+        // Track severity using precomputed rank
+        if (entry.rank > highestLineScore) {
+          highestLineScore = entry.rank;
           lineType = rule.type;
         }
       }
-    });
+    }
 
     // Save event if flagged
-    if (flaggedReasons.length > 0) {
+    if (flaggedReasons !== null && flaggedReasons.length > 0) {
+      flaggedLineCount++;
       events.push({
         lineNum: index + 1,
         ip,
@@ -146,10 +180,12 @@ function analyzeLogs(rawText) {
         reasons: flaggedReasons.join(', ')
       });
     }
-  });
+  }
 
   // Heuristics 2: IP Aggregation checks
-  Object.entries(ipStats).forEach(([ip, stats]) => {
+  const ipEntries = Object.entries(ipStats);
+  for (let i = 0; i < ipEntries.length; i++) {
+    const [ip, stats] = ipEntries[i];
     // Brute Force: 4+ Auth failures (401/403)
     const fails = stats[401] + stats[403];
     if (fails >= 4) {
@@ -190,7 +226,7 @@ function analyzeLogs(rawText) {
         reasons: 'Scanner Behavior'
       });
     }
-  });
+  }
 
   // Determine overall severity
   const score = Math.min(100, Math.round(riskTotal));
@@ -203,7 +239,7 @@ function analyzeLogs(rawText) {
 
   // Format final returns
   const findings = Array.from(findingsMap.values());
-  const uniqueIps = Object.keys(ipStats).length;
+  const uniqueIps = ipEntries.length;
 
   return {
     valid: true,
@@ -212,8 +248,8 @@ function analyzeLogs(rawText) {
     events,
     findings,
     summary: {
-      totalLines: lines.length,
-      flaggedLines: events.filter(e => e.lineNum !== 'Agg').length,
+      totalLines: parsedLineCount,
+      flaggedLines: flaggedLineCount,
       uniqueIps
     }
   };
@@ -323,12 +359,7 @@ function renderEventTable(events) {
 }
 
 function escapeHtml(unsafe) {
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+  return unsafe.replace(HTML_ESCAPE_REGEX, ch => HTML_ESCAPES[ch]);
 }
 
 function animateScore(targetScore, ringEl, numEl) {
@@ -414,69 +445,71 @@ function showError(msg) {
 
 // --- EVENT WIRING ---
 
-document.addEventListener('DOMContentLoaded', () => {
-  const logInput = document.getElementById('logInput');
-  const analyzeBtn = document.getElementById('analyzeBtn');
-  const clearBtn = document.getElementById('clearBtn');
-  const resetBtn = document.getElementById('resetBtn');
-  const resultsPanel = document.getElementById('resultsPanel');
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    const logInput = document.getElementById('logInput');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const resultsPanel = document.getElementById('resultsPanel');
 
-  // Input styling handling
-  logInput.addEventListener('input', () => {
-    clearBtn.style.display = logInput.value.length > 0 ? 'flex' : 'none';
-  });
-
-  clearBtn.addEventListener('click', () => {
-    logInput.value = '';
-    clearBtn.style.display = 'none';
-    logInput.focus();
-    resultsPanel.classList.add('hidden');
-  });
-
-  // Example Chips
-  document.querySelectorAll('.example-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
-      const type = chip.dataset.type;
-      logInput.value = SAMPLES[type] || '';
-      clearBtn.style.display = 'flex';
-      triggerAnalysis(logInput.value);
+    // Input styling handling
+    logInput.addEventListener('input', () => {
+      clearBtn.style.display = logInput.value.length > 0 ? 'flex' : 'none';
     });
-  });
 
-  // Analyze button
-  analyzeBtn.addEventListener('click', () => {
-    const val = logInput.value;
-    if (val.trim()) triggerAnalysis(val);
-  });
-
-  // Reset button
-  if (resetBtn) {
-    resetBtn.addEventListener('click', () => {
-      resultsPanel.classList.add('hidden');
+    clearBtn.addEventListener('click', () => {
       logInput.value = '';
       clearBtn.style.display = 'none';
       logInput.focus();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+      resultsPanel.classList.add('hidden');
     });
-  }
 
-  function triggerAnalysis(text) {
-    analyzeBtn.classList.add('loading');
-    analyzeBtn.disabled = true;
+    // Example Chips
+    document.querySelectorAll('.example-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const type = chip.dataset.type;
+        logInput.value = SAMPLES[type] || '';
+        clearBtn.style.display = 'flex';
+        triggerAnalysis(logInput.value);
+      });
+    });
 
-    // Simulate async processing
-    setTimeout(() => {
-      const result = analyzeLogs(text);
-      analyzeBtn.classList.remove('loading');
-      analyzeBtn.disabled = false;
+    // Analyze button
+    analyzeBtn.addEventListener('click', () => {
+      const val = logInput.value;
+      if (val.trim()) triggerAnalysis(val);
+    });
 
-      if (!result.valid) {
-        showError(result.error);
-      } else {
-        displayResults(result);
-      }
-    }, 600);
-  }
+    // Reset button
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        resultsPanel.classList.add('hidden');
+        logInput.value = '';
+        clearBtn.style.display = 'none';
+        logInput.focus();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    }
 
-  logInput.focus();
-});
+    function triggerAnalysis(text) {
+      analyzeBtn.classList.add('loading');
+      analyzeBtn.disabled = true;
+
+      // Simulate async processing
+      setTimeout(() => {
+        const result = analyzeLogs(text);
+        analyzeBtn.classList.remove('loading');
+        analyzeBtn.disabled = false;
+
+        if (!result.valid) {
+          showError(result.error);
+        } else {
+          displayResults(result);
+        }
+      }, 600);
+    }
+
+    logInput.focus();
+  });
+}
