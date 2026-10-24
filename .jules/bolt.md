@@ -1,0 +1,3 @@
+## 2026-10-20 - Single-pass line processing and regex hoisting in log parser
+**Learning:** In client-side log processing (`detector.js`), `rawText.split('\n').filter(...)` allocates large intermediate arrays and runs multiple array iterations. Hoisting regex constants (`IP_REGEX`, `STATUS_REGEX`, `HTML_ESCAPE_REGEX`), pre-flattening pattern entries with precomputed ranks, replacing `.forEach()`/`.filter()` with index-based `for` loops, and lazy-allocating arrays drastically reduces GC overhead.
+**Action:** Always prefer single-pass line splitting and static regex hoisting when processing large text payloads in JavaScript.
