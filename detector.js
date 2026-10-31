@@ -76,6 +76,26 @@ const SAMPLES = {
 10.0.0.8 - - [17/Mar/2026:09:05:12 +0000] "GET /favicon.ico HTTP/1.1" 200 115 "-" "Chrome/120.0.0.0"`
 };
 
+// --- PERFORMANCE OPTIMIZATION: HOISTED REGEXES & CACHED PATTERNS ---
+// Hoist static regex patterns and pre-flatten PATTERNS object with precomputed severity ranks
+// to eliminate repetitive regular expression instantiations and Object.entries() allocations per line.
+const IP_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
+const STATUS_REGEX = /\s([2345]\d{2})\s/;
+const HTML_ESCAPE_REGEX = /[&<>"']/g;
+const HTML_ESCAPES = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;'
+};
+
+const PATTERN_ENTRIES = Object.entries(PATTERNS).map(([key, rule]) => ({
+  key,
+  rule,
+  severityRank: rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1
+}));
+
 // --- CORE ANALYSIS ENGINE ---
 
 function analyzeLogs(rawText) {
@@ -83,61 +103,75 @@ function analyzeLogs(rawText) {
     return { valid: false, error: 'Log input is empty. Please paste logs first.' };
   }
 
-  const lines = rawText.split('\n').filter(l => l.trim().length > 0);
+  // Single-pass line splitting to avoid intermediate filter array allocation
+  const rawLines = rawText.split('\n');
+  const lines = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const l = rawLines[i];
+    if (l.trim().length > 0) {
+      lines.push(l);
+    }
+  }
+
   const events = [];
   const findingsMap = new Map();
   const ipStats = {};
 
   let riskTotal = 0;
+  let flaggedLinesCount = 0;
+  const numLines = lines.length;
+  const numPatterns = PATTERN_ENTRIES.length;
 
-  // regex to roughly extract IP and HTTP Status from common access logs
-  const ipRegex = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-  const statusRegex = /\s([2345]\d{2})\s/;
-
-  lines.forEach((line, index) => {
+  for (let index = 0; index < numLines; index++) {
+    const line = lines[index];
     let lineType = 'safe'; // default
     let highestLineScore = 0;
-    const flaggedReasons = [];
+    let flaggedReasons = null; // lazy allocation
     
-    // basic extraction
-    const ipMatch = line.match(ipRegex);
+    // basic extraction with hoisted regexes
+    const ipMatch = line.match(IP_REGEX);
     const ip = ipMatch ? ipMatch[0] : 'unknown';
-    const statusMatch = line.match(statusRegex);
-    const status = statusMatch ? parseInt(statusMatch[1], 10) : null;
+    const statusMatch = line.match(STATUS_REGEX);
+    const status = statusMatch ? +statusMatch[1] : null;
 
-    if (!ipStats[ip]) {
-      ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
+    let stats = ipStats[ip];
+    if (!stats) {
+      stats = ipStats[ip] = { count: 0, 401: 0, 403: 0, 404: 0, 500: 0 };
     }
-    ipStats[ip].count++;
-    if (status === 401) ipStats[ip][401]++;
-    if (status === 403) ipStats[ip][403]++;
-    if (status === 404) ipStats[ip][404]++;
-    if (status >= 500) ipStats[ip][500]++;
+    stats.count++;
+    if (status === 401) stats[401]++;
+    else if (status === 403) stats[403]++;
+    else if (status === 404) stats[404]++;
+    else if (status >= 500) stats[500]++;
 
-    // Regex Check 1: Iterating over defined patterns (SQLi, XSS, Path traversal, etc)
-    Object.entries(PATTERNS).forEach(([key, rule]) => {
+    // Regex Check 1: Iterating over pre-flattened PATTERN_ENTRIES
+    for (let p = 0; p < numPatterns; p++) {
+      const entry = PATTERN_ENTRIES[p];
+      const rule = entry.rule;
       if (rule.regex.test(line)) {
+        if (!flaggedReasons) flaggedReasons = [];
         flaggedReasons.push(rule.name);
         
         // Ensure finding appears only once in summary
-        if (!findingsMap.has(key)) {
-          findingsMap.set(key, { ...rule, occurrence: 1 });
+        const existingFinding = findingsMap.get(entry.key);
+        if (!existingFinding) {
+          findingsMap.set(entry.key, { ...rule, occurrence: 1 });
           riskTotal += rule.score; // only add score once per pattern type for overall log
         } else {
-          findingsMap.get(key).occurrence++;
+          existingFinding.occurrence++;
         }
 
-        // track severity
-        const lineVal = rule.type === 'critical' ? 3 : rule.type === 'high' ? 2 : 1;
-        if (lineVal > highestLineScore) {
-          highestLineScore = lineVal;
+        // track severity using precomputed severityRank
+        if (entry.severityRank > highestLineScore) {
+          highestLineScore = entry.severityRank;
           lineType = rule.type;
         }
       }
-    });
+    }
 
     // Save event if flagged
-    if (flaggedReasons.length > 0) {
+    if (flaggedReasons !== null) {
+      flaggedLinesCount++;
       events.push({
         lineNum: index + 1,
         ip,
@@ -146,7 +180,7 @@ function analyzeLogs(rawText) {
         reasons: flaggedReasons.join(', ')
       });
     }
-  });
+  }
 
   // Heuristics 2: IP Aggregation checks
   Object.entries(ipStats).forEach(([ip, stats]) => {
@@ -213,7 +247,7 @@ function analyzeLogs(rawText) {
     findings,
     summary: {
       totalLines: lines.length,
-      flaggedLines: events.filter(e => e.lineNum !== 'Agg').length,
+      flaggedLines: flaggedLinesCount,
       uniqueIps
     }
   };
@@ -323,12 +357,8 @@ function renderEventTable(events) {
 }
 
 function escapeHtml(unsafe) {
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+  // Single-pass replacement using precompiled regex and character map
+  return unsafe.replace(HTML_ESCAPE_REGEX, char => HTML_ESCAPES[char]);
 }
 
 function animateScore(targetScore, ringEl, numEl) {
