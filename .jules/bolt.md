@@ -1,0 +1,3 @@
+## 2026-03-17 - Precomputed Pattern Arrays and Single-Pass Log Traversal
+**Learning:** In high-volume client-side text scanners running in the browser, calling `Object.entries(PATTERNS).forEach(...)` inside a per-line loop creates short-lived arrays and callback closures for every single line, dominating runtime over the actual regex matching. Additionally, chaining multiple `.replace()` calls for HTML escaping causes multiple full string scans and temporary string allocations.
+**Action:** Always hoist reusable regexes and pre-flatten static pattern objects into an array with precomputed severity metrics before scanning loops; iterate using simple indexed `for` loops, and use regex lookup dictionaries for HTML escaping.
