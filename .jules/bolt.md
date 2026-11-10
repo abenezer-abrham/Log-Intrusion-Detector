@@ -1,0 +1,3 @@
+## 2026-03-31 - Hoisting regexes, static pattern entries, and zero-allocation log streaming
+**Learning:** In client-side log analyzers where the inner processing loop executes once per line across tens of thousands of lines, recreating regex literals within the function scope, invoking `Object.entries()` per line, and chaining intermediate array operations (`.split('\n').filter(...)`) create heavy garbage collection pressure and V8 object traversal overhead.
+**Action:** Hoist pattern regexes to static constants, pre-flatten dictionary rules into static entry arrays with pre-computed numeric severity ranks, cache dictionary lookups (`ipStats[ip]`) in local variables, and count summary metrics inline during a single sequential loop.
